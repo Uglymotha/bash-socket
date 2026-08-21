@@ -1,0 +1,101 @@
+This patch modifies the bash accept builtin and adds a socket builtin.
+This can be used to enable advanced unix socket and tcp/ip functionality
+to your bash scripts.
+
+bash-socket.patch can be applied directly to the bash source tree
+patch -Np1 -i bash-socket.patch
+
+socket: socket varname AF_UNIX|AF_INET|AF_INET6 SOCK_STREAM|SOCK_DGRAM local|peer PATH|ADDRESS [port] [queue]
+    creates a socket.
+    Provides an interface for creating and using POSIX sockets
+    The result socket handle is written to the variable denoted by varname.
+    Examples:
+             socket SOCKFD AF_UNIX SOCK_STREAM local /tmp/sock
+               Opens a local UNIX STREAM socket in /tmp/sock
+             socket SOCKFD af_inet6 sock_dgram local :: 12345
+               Opens a ipv6 udp socket on all ip addresses port 12345
+             socket SOCKFD AF_INET sock_stream local 1.2.3.4 80 100
+               Opens ipv4 tcp socket on ip 1.2.3.4 port 80 with queue size 100
+             socket fd AF_INET6 SOCK_STREAM PEER 2a00:400::1 443
+               Connects to ipv6 adress 2a00:400::1 on tcp port 443
+             socket fd af_unix sock_dgram PEER /tmp/sock
+               Connects to UNIX datagram socket /tmp/sock
+
+
+accept: accept [-b address] [-t timeout] [-v varname] [-s sockname] [-r rhost] [-p rport] [-q size] [-n] [-f] port
+    Accept a socket or a network connection on a specified port.
+    This builtin allows a bash script to act as a TCP/IP server.
+
+    Options, if supplied, have the following meanings:
+        -b address    use ADDRESS as the IP address to listen on; the
+                      default is INADDR_ANY
+        -t timeout    wait TIMEOUT seconds for a connection. TIMEOUT may
+                      be a decimal number including a fractional portion
+        -v varname    store the numeric file descriptor of the connected
+                      socket into VARNAME. The default VARNAME is ACCEPT_FD
+        -s sockname   store the numeric file descriptor of the listening
+                      socket into SOCKNAME. The default VARNAME is SOCK_FD,
+                      and is only set when -n is specified and -f is not.
+        -r rhost      store the IP address of the remote host into the shell
+                      variable RHOST, in dotted-decimal notation
+        -p rport      store the port nr of the remote host into the shell
+                      variable RPORT
+        -q size       Specify the queue size of connections waiting to be
+                      accepted on the listening socket.
+        -n            do not close the the listening socket and set SOCK_FD
+        -f            PORT is treated as a file descriptor of a STREAM
+                      socket, -s -b and -q are ignored -n is implied
+
+    If successful, the shell variable ACCEPT_FD, or the variable named by the
+    -v option, will be set to the fd of the connected socket, suitable for
+    use as 'read -u$ACCEPT_FD'. RHOST, if supplied, will hold the IP address
+    of the remote client, RPORT the remote port. The return status is 0.
+
+    If TIMEOUT is reached and no connection was accepted, the return status
+    is 0, with -n SOCKNAME will be set to the listening FD so accept can
+    be called again with -f. ACCEPT_FD will not be set.
+
+    With -f, if TIMEOUT is reached and no connection can be accepted, the
+    return status is 0, SOCK_FD and ACCEPT_FD will not be set.
+
+    On failure, the return status is 1 and all variables will be unset.
+
+    With -n the server socket fd will not be closed after accept returns
+    and SOCKNAME will be set to the listening fd. The fd can be polled
+    with accept -t0 -f fd. If no connection is waiting to be accepted
+    success will be returned with ACCEPT_FD unset.
+
+    This only creates TCP/IP sockets. If you want more fine grained control
+    like UNIX sockets or datagram / udp, use the socket loadable and
+    accept -f when applicable
+
+    Examples:
+              accept -t 0 -n -s SOCK 1234
+                Creates a listening socket on all ipv4 addresses, port 1234,
+                immediately returns success and the socket fd in SOCK_FD.
+              accept -t 2 -f ${SOCK_FD}
+                Waits 2 seconds for a client connection. If a connection is
+                made success is returned and ACCEPT_FD will contain the FD
+                of the connection. On timeout success is returned and
+                ACCEPT_FD will be unset.
+              accept -v FD -b 127.0.0.1 1234
+                Creates a one time listening server on localhost port 1234
+                Waits indefinitely for a connection, returns success and
+                the connection fd in FD, the listening socket will be closed.
+              accept -s SOCKFD -b ::1 -n 1234
+                Creates a one time listening server on localhost port 1234
+                Waits indefinitely for a connection, returns success with
+                the connection fd in ACCEPT_FD and the socket fd in SOCKFD.
+              accept -s SOCK -b :: -n -r RHOST -p RPORT -q 100 1234
+                Creates a listening socket on all ipv4/ipv6 addresses and
+                waits for connections indefinitely. If a connection is
+                accpted succes is returned, ACCEPT_FD will contain the fd
+                of the connection and SOCK_FD the fd of the listening socket,
+                RHOST the remote IP and RPORT the remote port.100 connections
+                can be queued waiting to be accepted.
+              accept -f -r RHOST -p RPORT 3
+                Waits indefinitely for connections on listening socket fd 3
+                If a connection is accepted success is returned ACCEPT_FD
+                contains the fd of the connection, RHOST to the remote IP
+                address and RPORT the remote port. If socket fd is not AF_INET
+                or AF_INET6, RHOST will be set to '-' and RPORT is undefined.

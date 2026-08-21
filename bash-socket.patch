@@ -1,0 +1,1706 @@
+diff -Naur bash.orig/examples/loadables/Makefile.in bash/examples/loadables/Makefile.in
+--- bash.orig/examples/loadables/Makefile.in	2026-08-18 11:57:59.000000000 +0200
++++ bash/examples/loadables/Makefile.in	2026-09-05 18:34:25.354210935 +0200
+@@ -103,7 +103,8 @@
+ ALLPROG = print truefalse sleep finfo logname basename dirname fdflags \
+ 	  tty pathchk tee head mkdir rmdir mkfifo mktemp printenv id whoami \
+ 	  uname sync push ln unlink realpath strftime mypid setpgid seq rm \
+-	  accept csv dsv cut stat getconf kv strptime chmod fltexpr
++	  csv dsv cut stat getconf kv strptime chmod fltexpr poll socket \
++	  accept
+ OTHERPROG = necho hello cat pushd asort
+ 
+ SUBDIRS = perl
+@@ -136,8 +137,14 @@
+ truefalse: truefalse.o
+ 	$(SHOBJ_LD) $(SHOBJ_LDFLAGS) $(SHOBJ_XLDFLAGS) -o $@ truefalse.o $(SHOBJ_LIBS)
+ 
+-accept:	accept.o
+-	$(SHOBJ_LD) $(SHOBJ_LDFLAGS) $(SHOBJ_XLDFLAGS) -o $@ accept.o $(SHOBJ_LIBS)
++poll:	poll.o
++	$(SHOBJ_LD) $(SHOBJ_LDFLAGS) $(SHOBJ_XLDFLAGS) -o $@ poll.o $(SHOBJ_LIBS) socket-lib.o
++
++socket:	socket-lib.o socket.o
++	$(SHOBJ_LD) $(SHOBJ_LDFLAGS) $(SHOBJ_XLDFLAGS) -o $@ socket.o $(SHOBJ_LIBS) socket-lib.o
++
++accept:	socket-lib.o accept.o
++	$(SHOBJ_LD) $(SHOBJ_LDFLAGS) $(SHOBJ_XLDFLAGS) -o $@ accept.o $(SHOBJ_LIBS) socket-lib.o
+ 
+ sleep:	sleep.o
+ 	$(SHOBJ_LD) $(SHOBJ_LDFLAGS) $(SHOBJ_XLDFLAGS) -o $@ sleep.o $(SHOBJ_LIBS)
+@@ -322,13 +329,16 @@
+        basename.o dirname.o tty.o pathchk.o tee.o head.o rmdir.o necho.o \
+        hello.o cat.o csv.o dsv.o kv.o cut.o printenv.o id.o whoami.o uname.o \
+        sync.o push.o mkdir.o mktemp.o realpath.o strftime.o setpgid.o stat.o \
+-       fdflags.o seq.o asort.o strptime.o chmod.o
++       fdflags.o seq.o asort.o strptime.o chmod.o socket-lib.o socket.o poll.o
+ 
+ ${OBJS}:	${BUILD_DIR}/config.h
+ 
+ print.o: print.c
+ truefalse.o: truefalse.c
+ accept.o: accept.c
++poll.o: socket.c
++socket.o: socket.c
++socket-lib.o: socket-lib.c
+ sleep.o: sleep.c
+ finfo.o: finfo.c
+ getconf.o: getconf.c getconf.h
+diff -Naur bash.orig/examples/loadables/accept.c bash/examples/loadables/accept.c
+--- bash.orig/examples/loadables/accept.c	2026-08-18 11:57:59.000000000 +0200
++++ bash/examples/loadables/accept.c	2026-09-05 18:34:25.354328742 +0200
+@@ -1,241 +1,240 @@
+ /* accept - listen for and accept a remote network connection on a given port */
+ /*
+-   Copyright (C) 2020,2022,2023 Free Software Foundation, Inc.
++     Copyright (C) 2020,2022,2023,2026 Free Software Foundation, Inc.
+ 
+-   This file is part of GNU Bash.
+-   Bash is free software: you can redistribute it and/or modify
+-   it under the terms of the GNU General Public License as published by
+-   the Free Software Foundation, either version 3 of the License, or
+-   (at your option) any later version.
+-
+-   Bash is distributed in the hope that it will be useful,
+-   but WITHOUT ANY WARRANTY; without even the implied warranty of
+-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-   GNU General Public License for more details.
++     This file is part of GNU Bash.
++     Bash is free software: you can redistribute it and/or modify
++     it under the terms of the GNU General Public License as published by
++     the Free Software Foundation, either version 3 of the License, or
++     (at your option) any later version.
++
++     Bash is distributed in the hope that it will be useful,
++     but WITHOUT ANY WARRANTY; without even the implied warranty of
++     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++     GNU General Public License for more details.
+ 
+-   You should have received a copy of the GNU General Public License
+-   along with Bash.  If not, see <http://www.gnu.org/licenses/>.
++     You should have received a copy of the GNU General Public License
++     along with Bash.  If not, see <http://www.gnu.org/licenses/>.
+ */
+ 
+-#include <config.h>
++#include "socket.h"
+ 
+-#if defined (HAVE_UNISTD_H)
+-#  include <unistd.h>
+-#endif
+-
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <unistd.h>
+-#include "bashtypes.h"
+-#include <errno.h>
+-#include <time.h>
+-#include <limits.h>
+-#include "typemax.h"
+-
+-#include <sys/socket.h>
+-#include <arpa/inet.h>
+-#include <netinet/in.h>
+-
+-#include "loadables.h"
+-
+-static int accept_bind_variable (char *, int);
+-
+-int
+-accept_builtin (WORD_LIST *list)
+-{
+-  SHELL_VAR *v;
+-  intmax_t iport;
+-  int opt;
+-  char *tmoutarg, *fdvar, *rhostvar, *rhost, *bindaddr;
+-  unsigned short uport;
+-  int servsock, clisock;
+-  struct sockaddr_in server, client;
+-  socklen_t clientlen;
+-  struct timeval timeval;
+-  struct linger linger = { 0, 0 };
+-
+-  rhostvar = tmoutarg = fdvar = rhost = bindaddr = (char *)NULL;
+-
+-  reset_internal_getopt ();
+-  while ((opt = internal_getopt (list, "b:r:t:v:")) != -1)
+-    {
+-      switch (opt)
+-	{
+-	case 'b':
+-	  bindaddr = list_optarg;
+-	  break;
+-	case 'r':
+-	  rhostvar = list_optarg;
+-	  break;
+-	case 't':
+-	  tmoutarg = list_optarg;
+-	  break;
+-	case 'v':
+-	  fdvar = list_optarg;
+-	  break;
+-	CASE_HELPOPT;
+-	default:
+-	  builtin_usage ();
+-	  return (EX_USAGE);
+-	}
+-    }
+-  
+-  list = loptend;
+-
+-  /* Validate input and variables */
+-  if (tmoutarg)
+-    {
+-      long ival, uval;
+-      opt = uconvert (tmoutarg, &ival, &uval, (char **)0);
+-      if (opt == 0 || ival < 0 || uval < 0)
+-	{
+-	  builtin_error ("%s: invalid timeout specification", tmoutarg);
+-	  return (EXECUTION_FAILURE);
+-	}
+-      timeval.tv_sec = ival;
+-      timeval.tv_usec = uval;
+-      /* XXX - should we warn if ival == uval == 0 ? */
+-    }
+-
+-  if (list == 0)
+-    {
+-      builtin_usage ();
+-      return (EX_USAGE);
+-    }
+-
+-  if (valid_number (list->word->word, &iport) == 0 || iport < 0 || iport > TYPE_MAXIMUM (unsigned short))
+-    {
+-      builtin_error ("%s: invalid port number", list->word->word);
+-      return (EXECUTION_FAILURE);
+-    }
+-  uport = (unsigned short)iport;
+-
+-  if (fdvar == 0)
+-    fdvar = "ACCEPT_FD";
+-
+-  unbind_variable (fdvar);
+-  if (rhostvar)
+-    unbind_variable (rhostvar);
+-    
+-  if ((servsock = socket (AF_INET, SOCK_STREAM, IPPROTO_IP)) < 0)
+-    {
+-      builtin_error ("cannot create socket: %s", strerror (errno));
+-      return (EXECUTION_FAILURE);
+-    }
+-
+-  memset ((char *)&server, 0, sizeof (server));
+-  server.sin_family = AF_INET;
+-  server.sin_port = htons(uport);
+-  server.sin_addr.s_addr = bindaddr ? inet_addr (bindaddr) : htonl(INADDR_ANY);
+-
+-  if (server.sin_addr.s_addr == INADDR_NONE)
+-    {
+-      builtin_error ("invalid address: %s", strerror (errno));
+-      return (EXECUTION_FAILURE);
+-    }
+-
+-  opt = 1;
+-  setsockopt (servsock, SOL_SOCKET, SO_REUSEADDR, (void *)&opt, sizeof (opt));
+-  setsockopt (servsock, SOL_SOCKET, SO_LINGER, (void *)&linger, sizeof (linger));
+-
+-  if (bind (servsock, (struct sockaddr *)&server, sizeof (server)) < 0)
+-    {
+-      builtin_error ("socket bind failure: %s", strerror (errno));
+-      close (servsock);
+-      return (EXECUTION_FAILURE);
+-    }
+-
+-  if (listen (servsock, 1) < 0)
+-    {
+-      builtin_error ("listen failure: %s", strerror (errno));
+-      close (servsock);
+-      return (EXECUTION_FAILURE);
+-    }
+-
+-  if (tmoutarg)
+-    {
+-      fd_set iofds;
+-
+-      FD_ZERO(&iofds);
+-      FD_SET(servsock, &iofds);
+-
+-      opt = select (servsock+1, &iofds, 0, 0, &timeval);
+-      if (opt < 0)
+-	builtin_error ("select failure: %s", strerror (errno));
+-      if (opt <= 0)
+-	{
+-	  close (servsock);
+-	  return (EXECUTION_FAILURE);
+-	}
+-    }
+-
+-  clientlen = sizeof (client);
+-  if ((clisock = accept (servsock, (struct sockaddr *)&client, &clientlen)) < 0)
+-    {
+-      builtin_error ("client accept failure: %s", strerror (errno));
+-      close (servsock);
+-      return (EXECUTION_FAILURE);
+-    }
+-
+-  close (servsock);
+-
+-  accept_bind_variable (fdvar, clisock);  
+-  if (rhostvar)
+-    {
+-      rhost = inet_ntoa (client.sin_addr);
+-      v = builtin_bind_variable (rhostvar, rhost, 0);
+-      if (v == 0 || readonly_p (v) || noassign_p (v))
+-	builtin_error ("%s: cannot set variable", rhostvar);
+-    }
+-
+-  return (EXECUTION_SUCCESS);
+-}
++#define FAIL_EXECUTION ACCEPT_FAIL_EXECUTION
+ 
+-static int
+-accept_bind_variable (char *varname, int intval)
+-{
+-  SHELL_VAR *v;
+-  char ibuf[INT_STRLEN_BOUND (int) + 1], *p;
+-
+-  p = fmtulong (intval, 10, ibuf, sizeof (ibuf), 0);
+-  v = builtin_bind_variable (varname, p, 0);		/* XXX */
+-  if (v == 0 || readonly_p (v) || noassign_p (v))
+-    builtin_error ("%s: cannot set variable", varname);
+-  return (v != 0);
++int accept_builtin (WORD_LIST *list) {
++    intmax_t iport, bl = 1;
++    int opt, portfd = 0, noclose = 0;
++    char *tmoutarg = NULL, *bindaddr = NULL, *queue = NULL;
++    vars var;
++    int servsock = -1, clisock = -1;
++    soaddr server, client;
++    socklen_t clientlen = sizeof(client);
++    struct timespec timeout = { -1, -1 };
++    struct linger linger = { 0, 0 };
++
++    /* Parse command line, validate input and variables */
++    memset ((char *)&var, 0, sizeof (var));
++    memset ((char *)&server, 0, sizeof (soaddr));
++    memset ((char *)&client, 0, sizeof (soaddr));
++    reset_internal_getopt ();
++    while ((opt = internal_getopt(list, "b:fnp:q:r:s:t:v:")) != -1) {
++        if (opt == 'r' || opt == 'p' || opt == 'v' || opt == 's')
++            if (    !valid_identifier(list_optarg)
++                 && !valid_array_reference(list_optarg, 0))
++                FAIL_EXECUTION(-1, -1, "%s: invalid variable name", list_optarg);
++        switch (opt) {
++        case 'b':
++            bindaddr = list_optarg;
++            break;
++        case 'r':
++            var.host = list_optarg;
++           break;
++        case 't':
++            tmoutarg = list_optarg;
++            break;
++        case 'v':
++            var.fd = list_optarg;
++            break;
++        case 'p':
++            var.port = list_optarg;
++            break;
++        case 'q':
++            queue = list_optarg;
++            break;
++        case 's':
++            var.sock = list_optarg;
++            break;
++        case 'f':
++            portfd = 1;  // Fall Through
++        case 'n':
++            noclose = 1;
++            break;
++        CASE_HELPOPT;
++        default:
++            USAGE();
++        }
++    }
++    if ((list = loptend) == NULL)
++        USAGE();
++    if (tmoutarg) {
++        opt = uconvert(tmoutarg, &timeout.tv_sec, &timeout.tv_nsec, (char **)0);
++        if (opt == 0 || timeout.tv_sec < 0 || timeout.tv_nsec < 0)
++            FAIL_EXECUTION(-1, -1, "%s: invalid timeout specification", tmoutarg);
++        timeout.tv_nsec *= 1000;
++    }
++    if (queue && (!valid_number(queue, &bl) || bl < 1 || bl > TYPE_MAXIMUM(int)))
++        FAIL_EXECUTION(-1, -1, "%s: invalid queue size", queue);
++    /* -f (portfd = 1) port = fd */
++    if (portfd == 1 && (    !valid_number(list->word->word, &iport)
++                         || iport < 0 || iport > TYPE_MAXIMUM (int)))
++        FAIL_EXECUTION(-1, -1, "%s: invalid socket fd", list->word->word);
++    if (    portfd == 0
++         && (errno = accept_parse_address(&list, &server, bindaddr, 1)) < 0)
++        FAIL_EXECUTION(-1, -1, NULL, 0);
++    if (var.fd == NULL)
++        var.fd = "ACCEPT_FD";
++    if (var.sock == NULL && noclose == 1 && portfd != 1)
++        var.sock = "SOCK_FD";
++    accept_unbind_variables(var);
++
++    /* Accept the fd (-f). On timeout return success with ACCEPT_FD NOT set.
++     * Never set SOCK_FD or close the fd */
++    if (portfd == 1 && (opt = accept_timeout(iport, &timeout, NULL)) < 0)
++        FAIL_EXECUTION(-1, -1, NULL, 0);
++    if (portfd == 1 && opt > 0) {
++        if ((clisock = accept(iport, (SA)&client, &clientlen)) < 0)
++            FAIL_EXECUTION(-1, -1, "accept failure: %s", strerror(errno));
++        else if (    !accept_bind_variable
++                  ||  (var.port, htons(client.in.sin_port), NULL, NULL)
++                  || !accept_bind_variable(var.host, -1, &client, NULL)
++                  || !accept_bind_variable(var.fd, clisock, NULL, NULL))
++            FAIL_EXECUTION(clisock, -1, NULL, 0);
++    }
++    if (portfd == 1)
++        return EXECUTION_SUCCESS;
++
++    /* Open bind and listen to socket, on failure close fd and do not set vars */
++    if ((servsock = socket(server.sa.sa_family, SOCK_STREAM, IPPROTO_IP)) < 0)
++        FAIL_EXECUTION(-1, -1, "socket failure: %s", strerror(errno));
++    opt = 1;
++    if ( setsockopt
++         (servsock, SOL_SOCKET, SO_REUSEADDR, (void *)&opt, sizeof(opt)) < 0
++         ||
++         setsockopt
++         (servsock, SOL_SOCKET, SO_LINGER, (void *)&linger, sizeof(linger)) < 0)
++        FAIL_EXECUTION(servsock, -1, "setsockopt failure: %s", strerror(errno));
++    if (bind(servsock, (SA)&server, sizeof(server)) < 0)
++        FAIL_EXECUTION(servsock, -1, "bind failure: %s", strerror(errno));
++    if (listen (servsock, bl) < 0)
++        FAIL_EXECUTION(servsock, -1, "listen failure: %s", strerror(errno));
++
++    /* On timeout with -n return success, failure otherwise */
++    if ((opt = accept_timeout(servsock, &timeout, var.sock)) < 0)
++        FAIL_EXECUTION(servsock, -1, NULL, 0);
++    if (opt == 0 && noclose != 0)
++        return EXECUTION_SUCCESS;
++
++    /* Accept connection and set appropriate variables. On error close fds
++     * and clear all variables */
++    if ((clisock = accept(servsock, (SA)&client, &clientlen)) < 0)
++          builtin_error("accept failure: %s", strerror(errno));
++    if (    clisock < 0
++         || !accept_bind_variable(var.fd, clisock, NULL, NULL)
++         || !accept_bind_variable(var.host, -1, &client, NULL)
++         || !accept_bind_variable
++             (var.port, htons(client.in.sin_port), NULL, NULL))
++        FAIL_EXECUTION(servsock, clisock, NULL, 0);
++
++    if (noclose == 0)
++        close (servsock);
++    return EXECUTION_SUCCESS;
+ }
+ 
+ char *accept_doc[] = {
+-	"Accept a network connection on a specified port.",
+-	""
+-	"This builtin allows a bash script to act as a TCP/IP server.",
+-	"",
+-	"Options, if supplied, have the following meanings:",
+-	"    -b address    use ADDRESS as the IP address to listen on; the",
+-	"                  default is INADDR_ANY",
+-	"    -t timeout    wait TIMEOUT seconds for a connection. TIMEOUT may",
+-	"                  be a decimal number including a fractional portion",
+-	"    -v varname    store the numeric file descriptor of the connected",
+-	"                  socket into VARNAME. The default VARNAME is ACCEPT_FD",
+-	"    -r rhost      store the IP address of the remote host into the shell",
+-	"                  variable RHOST, in dotted-decimal notation",
+-	"",
+-	"If successful, the shell variable ACCEPT_FD, or the variable named by the",
+-	"-v option, will be set to the fd of the connected socket, suitable for",
+-	"use as 'read -u$ACCEPT_FD'. RHOST, if supplied, will hold the IP address",
+-	"of the remote client. The return status is 0.",
+-	"",
+-	"On failure, the return status is 1 and ACCEPT_FD (or VARNAME) and RHOST,",
+-	"if supplied, will be unset.",
+-	"",
+-	"The server socket fd will be closed before accept returns.",
+-	(char *) NULL
++    "Accept a socket or a network connection on a specified port.",
++    "This builtin allows a bash script to act as a TCP/IP server.",
++    "",
++    "Options, if supplied, have the following meanings:",
++    "    -b address    Use ADDRESS as the IP address to listen on; the",
++    "                  default is INADDR_ANY. For AF_UNIX sockets a path",
++    "                  can be specified",
++    "    -t timeout    Wait TIMEOUT seconds for a connection. TIMEOUT may",
++    "                  be a decimal number including a fractional portion",
++    "    -v varname    Store the numeric file descriptor of the connected",
++    "                  socket into VARNAME. The default VARNAME is ACCEPT_FD",
++    "    -s sockname   Store the numeric file descriptor of the listening",
++    "                  socket into SOCKNAME. The default VARNAME is SOCK_FD,",
++    "                  and is only set when -n is specified and -f is not.",
++    "    -r rhost      Store the IP address of the remote host into the shell",
++    "                  variable RHOST, in dotted-decimal notation",
++    "    -p rport      Store the port nr of the remote host into the shell",
++    "                  variable RPORT",
++    "    -q size       Specify the queue size of connections waiting to be",
++    "                  accepted on the listening socket.",
++    "    -n            Do not close the the listening socket and set SOCK_FD",
++    "    -f            PORT is treated as a file descriptor of a STREAM",
++    "                  socket, -s -b and -q are ignored -n is implied",
++    "",
++    "If successful, the shell variable ACCEPT_FD, or the variable named by the",
++    "-v option, will be set to the fd of the connected socket, suitable for",
++    "use as 'read -u$ACCEPT_FD'. RHOST, if supplied, will hold the IP address",
++    "of the remote client, RPORT the remote port. The return status is 0.",
++    "",
++    "If TIMEOUT is reached and no connection was accepted, the return status",
++    "is 0, with -n SOCKNAME will be set to the listening FD so accept can",
++    "be called again with -f. ACCEPT_FD will not be set.",
++    "",
++    "With -f, if TIMEOUT is reached and no connection can be accepted, the",
++    "return status is 0, SOCK_FD and ACCEPT_FD will not be set.",
++    "",
++    "On failure, the return status is 1 and all variables will be unset.",
++    "",
++    "With -n the server socket fd will not be closed after accept returns",
++    "and SOCKNAME will be set to the listening fd. The fd can be polled",
++    "with accept -t0 -f fd. If no connection is waiting to be accepted",
++    "success will be returned with ACCEPT_FD unset.",
++    "",
++    "Examples:",
++    "          accept -t 0 -n -s SOCK 1234",
++    "            Creates a listening socket on all ipv4 addresses, port 1234,",
++    "            immediately returns success and the socket fd in SOCK_FD.",
++    "          accept -t 2 -f ${SOCK_FD}",
++    "            Waits 2 seconds for a client connection. If a connection is",
++    "            made success is returned and ACCEPT_FD will contain the FD",
++    "            of the connection. On timeout success is returned and",
++    "            ACCEPT_FD will be unset.",
++    "          accept -t10 -n -b /tmp/sock",
++    "            Creates an AF_UNIX socket bound to /tmp/sock. Waits 10 seconds",
++    "            for a connection and saves the fd in SOCK_FD",
++    "          accept -v FD -b 127.0.0.1 1234",
++    "            Creates a one time listening server on localhost port 1234",
++    "            Waits indefinitely for a connection, returns success and",
++    "            the connection fd in FD, the listening socket will be closed.",
++    "          accept -s SOCKFD -b ::1 -n 1234",
++    "            Creates a one time listening server on localhost port 1234",
++    "            Waits indefinitely for a connection, returns success with",
++    "            the connection fd in ACCEPT_FD and the socket fd in SOCKFD.",
++    "          accept -s SOCK -b :: -n -r RHOST -p RPORT -q 100 1234",
++    "            Creates a listening socket on all ipv4/ipv6 addresses and",
++    "            waits for connections indefinitely. If a connection is",
++    "            accpted succes is returned, ACCEPT_FD will contain the fd",
++    "            of the connection and SOCK_FD the fd of the listening socket,",
++    "            RHOST the remote IP and RPORT the remote port.100 connections",
++    "            can be queued waiting to be accepted.",
++    "          accept -f -r RHOST -p RPORT 3",
++    "            Waits indefinitely for connections on listening socket fd 3",
++    "            If a connection is accepted success is returned ACCEPT_FD",
++    "            contains the fd of the connection, RHOST to the remote IP",
++    "            address and RPORT the remote port. If socket fd is AF_UNIX",
++    "            RHOST will be set to the remote path and RPORT is undefined.",
++    (char *) NULL
+ };
+ 
+ struct builtin accept_struct = {
+-	"accept",		/* builtin name */
+-	accept_builtin,		/* function implementing the builtin */
+-	BUILTIN_ENABLED,	/* initial flags for builtin */
+-	accept_doc,		/* array of long documentation strings. */
+-	"accept [-b address] [-t timeout] [-v varname] [-r addrvar ] port",		/* usage synopsis; becomes short_doc */
+-	0			/* reserved for internal use */
++    "accept",               /* builtin name */
++    accept_builtin,         /* function implementing the builtin */
++    BUILTIN_ENABLED,        /* initial flags for builtin */
++    accept_doc,             /* array of long documentation strings. */
++    "accept [-b address] [-t timeout] [-v varname] [-s sockname] [-r rhost] [-p rport] [-q size] [-n] [-f] [port]", /* usage synopsis; becomes short_doc */
++    0                       /* reserved for internal use */
+ };
+diff -Naur bash.orig/examples/loadables/poll.c bash/examples/loadables/poll.c
+--- bash.orig/examples/loadables/poll.c	1970-01-01 01:00:00.000000000 +0100
++++ bash/examples/loadables/poll.c	2026-09-05 18:34:25.354402016 +0200
+@@ -0,0 +1,219 @@
++/* poll - poll a set of file descriptors for i/o */
++/*
++   Copyright (C) 2020,2022,2023,2026 Free Software Foundation, Inc.
++
++   This file is part of GNU Bash.
++   Bash is free software: you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation, either version 3 of the License, or
++   (at your option) any later version.
++
++   Bash is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with Bash.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#include "socket.h"
++
++#define CLEANUP do {                                           \
++    for (l = lmin; l < lmax; free(fd[l]), l++);                \
++    for (l = lmin; l < lmax; free(buf[l]), l++);              \
++    free(pollfd); } while (0)
++#define EXIT_OK(x) do {                                        \
++    CLEANUP;                                                   \
++    return EXECUTION_SUCCESS; } while (0)
++#define FAIL_EXECUTION(msg, ...) do {                          \
++    CLEANUP;                                                   \
++    POLL_FAIL_EXECUTION(-1, -1, msg, __VA_ARGS__); } while (0)
++
++enum lists { lmin = 0, lread = 0, lwrite, lpri,
++             lerr, lhup, linval, lmax };
++
++static const int poll_builtin(WORD_LIST *list) {
++    vars var;
++    intmax_t c[lmax], res, e, i, n, l, s;
++    intmax_t nfd[lerr] = { 0, 0, 0 }, *fd[lmax];
++    struct timespec timeout, *to = NULL;
++    char *buf[lmax], varbuf[6][VARSIZE], *name;
++    struct pollfd *pollfd = NULL;
++    SHELL_VAR *shvar;
++    memset((char *)&var, 0, sizeof(var));
++    memset(fd, 0, lmax * sizeof(void *));
++    memset(buf, 0, lmax * sizeof(void *));
++
++    if (list == NULL || strcasecmp(list->word->word, "-h") == 0)
++        USAGE();
++    if (strcasecmp(list->word->word, "-v") == 0) {
++        if ((list = list->next) == NULL || !valid_identifier(list->word->word))
++            var.base = "POLL";
++        else if (strlen(list->word->word) > VARSIZE - 6 - 1)
++            FAIL_EXECUTION("variable base must be <%d characters", VARSIZE - 6);
++        else {
++            var.base = list->word->word;
++            if ((list = list->next) == NULL)
++                USAGE();
++        }
++    }
++    if (!uconvert(list->word->word, &timeout.tv_sec, &timeout.tv_nsec, NULL))
++        FAIL_EXECUTION("%s: invalid timeout", list->word->word);
++    if (timeout.tv_sec >= 0 && timeout.tv_nsec >= 0) {
++        timeout.tv_nsec *= 1000;
++        to = &timeout;
++    }
++    for (l = i = 0; (var.base != NULL && l < lmax) || (list = list->next);
++         nfd[l] += (var.base == NULL && n >= nfd[l]), l += (var.base != NULL)) {
++        if (var.base == NULL)
++            switch (*(char *)list->word->word) {
++            case 'r': case 'R':
++                l = lread, list = list->next; break;
++            case 'w': case 'W':
++                l = lwrite, list = list->next; break;
++            case 'p': case 'P':
++                l = lpri, list = list->next; break;
++            }
++        if ((nfd[l] % 64) == 0) {
++            s = (nfd[l] + 64) * sizeof(intmax_t);
++            if ((fd[l] = realloc(fd[l], s)) == NULL)
++                FAIL_EXECUTION("realloc failure", strerror(errno));
++        }
++        if (var.base == NULL && !valid_number(list->word->word, &fd[l][nfd[l]]))
++            FAIL_EXECUTION("invalid fd: %s", list->word->word);
++        else if (var.base == NULL)
++            /* Skip duplicates */
++            for (n = 0; n < nfd[l] && fd[l][n] != fd[l][nfd[l]]; n++);
++        else if (var.base != NULL) {
++            name = l == lread ? "READFD" : l == lwrite ? "WRITEFD" :
++                   l == lpri  ? "PRIFD"  : l == lerr   ? "ERRFD" :
++                   l == lhup  ? "HUPFD"  : "INVFD";
++            if ( (i = snprintf(varbuf[l], VARSIZE, "%s_%s", var.base, name)) < 0
++                 || i > VARSIZE)
++                FAIL_EXECUTION("buffer error", 0);
++            if (l >= lerr)
++                continue;
++            if ((shvar = find_variable(varbuf[l])) != NULL) {
++                name = strtok(shvar->value, " ");
++                while (name != NULL && valid_number(name, &fd[l][nfd[l]])) {
++                    for (n = 0; n < nfd[l] && fd[l][n] != fd[l][nfd[l]]; n++);
++                    nfd[l] += (n >= nfd[l]);
++                    name = strtok(NULL, " ");
++                }
++                if (name != NULL)
++                    FAIL_EXECUTION("invalid fd: %s", name);
++            }
++        }
++    }
++    if (var.base != NULL) {
++        var.readfd = varbuf[lread];
++        var.writefd = varbuf[lwrite];
++        var.prifd = varbuf[lpri];
++        var.errfd = varbuf[lerr];
++        var.hupfd = varbuf[lhup];
++        var.invfd = varbuf[linval];
++    }
++    poll_unbind_variables(var);
++
++    if (nfd[0] + nfd[1] + nfd[2] == 0)
++        FAIL_EXECUTION("you must specify at least one fd", 0);
++    for (n = 0, l = e = lmin; l < lerr; l++)
++    for (i = s = 0; i < nfd[l]; i++, n += (s == n), e = l) {
++        /* Create and fill pollfds for each list of fds parsed from cli */
++        if (n == 0 || ((n % 64) == 0 && e == l)) {
++            /* Alloc per 64 pollfds. Special case: when just alloced and then
++             * immediately the list is switched we must not realloc again */
++            s = (n + 64) * sizeof(struct pollfd);
++            if ((pollfd = realloc(pollfd, s)) == NULL) 
++                FAIL_EXECUTION("realloc failure: %s",strerror(errno));
++            for (e = n; e < n + 64; e++)
++                pollfd[e] = (struct pollfd){ -1, 0, 0 };
++        }
++        for (s = 0; s < n && pollfd[s].fd != fd[l][i]; s++);
++        pollfd[s].fd = fd[l][i];
++        pollfd[s].events |= (l == lread  ? POLLIN  :
++                             l == lwrite ? POLLOUT : POLLPRI);
++    }
++
++    if ((res = ppoll(pollfd, n, to, NULL)) < 0)
++        FAIL_EXECUTION("poll failure: %s", strerror(errno));
++    if (res == 0)
++        EXIT_OK();
++    for (i = 0; i < n; i++)
++    for (l = lmin, s = n * 24; l < lmax; l++) {
++        /* Go over all pollfds and lists. Only output when fds are ready */
++        if (buf[l] == NULL) {
++            /* 64b int < 24 chars, alloc buffers for each output list. */
++            if ((buf[l] = malloc(s)) == NULL)
++                FAIL_EXECUTION("malloc failure", strerror(errno));
++            buf[l][0] = l == lread ? 'R' : l == lwrite ? 'W' :
++                        l == lpri  ? 'P' : l == lerr   ? 'E' :
++                        l == lhup  ? 'H' : 'I';
++            buf[l][1] = '\0';
++            c[l] = 1;
++        }
++        /* Check for events and output fd to respective buffer */
++        e = l == lread ? POLLIN  : l == lwrite ? POLLOUT :
++            l == lpri  ? POLLPRI : l == lerr   ? POLLERR :
++            l == lhup  ? POLLHUP : POLLNVAL;
++        if (pollfd[i].revents & e) {
++            c[l] += snprintf(buf[l] + c[l], s - c[l], " %d", pollfd[i].fd);
++            if (c[l] >= s || c[l] <= 0)
++                FAIL_EXECUTION("buffer error", 0);
++        }
++    }
++    for (l = lmin; l < lmax; l++) {
++        /* Output each list when not empty */
++        if (c[l] > 1) {
++            if (var.base == NULL)
++                fprintf(stdout, "%s\n", buf[l]);
++            else if (!poll_bind_variable(varbuf[l], -1, NULL, &buf[l][2]))
++                FAIL_EXECUTION(NULL, 0);
++        }
++    }
++    EXIT_OK();
++}
++
++static char *const poll_doc[] = {
++    "Polls a set of FDs for IO. Outputs the FDs that have data to e ready.",
++    "Timeout can be any number, including fractions. A negative nr means",
++    "no timeout. On timoeut success is returned with no output if no fds.",
++    "are ready.",
++    "poll takes sets of fd, one set to check for read, one for write and one",
++    "for priority. Indicated by r, w, and p respectively (or any word starting",
++    "with these letters). The default set is read.",
++    "Examples:",
++    "         poll 10 r 1 2 3 w 3 4 5 e 2 6 7",
++    "           Polls FDs 1 2 3 for read events, 3 3 5 for write events and",
++    "           2 6 7 for execptions. With a timout of 10 seconds.",
++    "         poll 5.3 1 2 3 8",
++    "           Polls FDs 1 2 3 8 for read events with a timeout of 5.3 seconds.",
++    "         poll 0 1 2 3 w 5 6 7",
++    "           Checks if FDs 1 2 3 are ready for read and 5 6 7 are ready for",
++    "           write, returns immediately.",
++    "         poll 0 1 2 3 e 5 6 7",
++    "           Checks if FDs 1 2 3 are ready for read and 5 6 7 are have",
++    "           execeptions, returns immediately.",
++    "         poll 0 write 0 read 1 w 2 r 3",
++    "           FD sets can be specified multiple time on the command line.",
++    "",
++    "Output:",
++    "Poll will output any, either or all of the following lines:",
++    "R fd ....      -  POLLIN   FDs (ready for read).",
++    "W fd ....      -  POLLOUT  FDs (ready for write).",
++    "P fd ....      -  POLLPRI  FDs (exceptions).",
++    "E fd ....      -  POLERR   FDs (connection reset by peer).",
++    "H fd ....      -  POLLHUP  FDs (hungup on the write end).",
++    "I fd ....      -  POLLNVAL FDs (invalid / not exist).",
++    NULL
++};
++
++struct builtin poll_struct = {
++    .name = "poll",
++    .function = poll_builtin,
++    .flags = BUILTIN_ENABLED,
++    .long_doc = poll_doc,
++    .short_doc = "poll [-v [var]] timeout [r fd1 [fd2] ... w fd1 [fd2] ... e fd1 [fd2] ...]",
++    .handle = NULL
++};
+diff -Naur bash.orig/examples/loadables/socket-lib.c bash/examples/loadables/socket-lib.c
+--- bash.orig/examples/loadables/socket-lib.c	1970-01-01 01:00:00.000000000 +0100
++++ bash/examples/loadables/socket-lib.c	2026-09-05 18:34:25.354469510 +0200
+@@ -0,0 +1,222 @@
++/* accept - listen for and accept a remote network connection on a given port */
++/*
++   Copyright (C) 2020,2022,2023,2026 Free Software Foundation, Inc.
++
++   This file is part of GNU Bash.
++   Bash is free software: you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation, either version 3 of the License, or
++   (at your option) any later version.
++
++   Bash is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with Bash.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#include "socket.h"
++
++const int socket_bind_variable_and_check
++(const char *const varname, const int intval, const soaddr *client,
++ char *str) {
++    /* Set varname to either intval or client IP string */
++    SHELL_VAR *v;
++    char ibuf[PATH_MAX], *p;
++    void *addr;
++    int opt = 1;
++
++    if (varname == NULL || (intval < 0
++                            && (client == NULL
++                                || client->sa.sa_family == AF_UNSPEC)
++                            && str == NULL))
++        return (1);
++
++    if (client != NULL && client->sa.sa_family == AF_INET)
++        addr = (void *)&client->in.sin_addr;
++    else if (client != NULL)
++        addr = (void *)&client->in6.sin6_addr;
++
++    /* If client is not AF_INET(6) var value = "-" */
++    if (intval >= 0)
++        p = fmtulong(intval, 10, ibuf, sizeof (ibuf), 0);
++    else if (client != NULL) {
++        if (client->sa.sa_family == AF_INET || client->sa.sa_family == AF_INET6)
++            p = (char *)inet_ntop(client->sa.sa_family, addr, ibuf,
++                                  sizeof(ibuf));
++        else if ((p = ibuf)) {
++            opt = snprintf(ibuf, sizeof(ibuf), "%s", client->un.sun_path);
++            if (opt <= 0 || opt > sizeof(ibuf))
++                builtin_error("buffer error: %s", strerror(errno));
++        }
++    } else
++        p = str;
++    if (opt > 0 && p != NULL)
++        v = builtin_bind_variable((char *)varname, p, 0);
++    if (opt < 0 || p == NULL || v == 0 || readonly_p (v) || noassign_p (v)) {
++        if (v != 0)
++            unbind_variable(varname);
++        v = 0;
++        builtin_error("%s: cannot set variable: %s", varname, strerror(errno));
++    }
++    return (v != 0);
++}
++
++void socket_unbind_variables_and_check(const vars var) {
++    /* Reset all shell variables, var.sock is only set with -n and not -f */
++    if (var.fd)
++        unbind_variable(var.fd);
++    if (var.sock)
++        unbind_variable(var.sock);
++    if (var.host)
++        unbind_variable(var.host);
++    if (var.port)
++        unbind_variable(var.port);
++    if (var.lhost)
++        unbind_variable(var.lhost);
++    if (var.lport)
++        unbind_variable(var.lport);
++    if (var.size)
++        unbind_variable(var.size);
++    if (var.eerrno)
++        unbind_variable(var.eerrno);
++    if (var.eorig)
++        unbind_variable(var.eorig);
++    if (var.etype)
++        unbind_variable(var.etype);
++    if (var.ecode)
++        unbind_variable(var.ecode);
++    if (var.eoffen)
++        unbind_variable(var.eoffen);
++    if (var.esize)
++        unbind_variable(var.esize);
++    if (var.readfd)
++        unbind_variable(var.readfd);
++    if (var.writefd)
++        unbind_variable(var.writefd);
++    if (var.prifd)
++        unbind_variable(var.prifd);
++    if (var.errfd)
++        unbind_variable(var.errfd);
++    if (var.hupfd)
++        unbind_variable(var.hupfd);
++    if (var.invfd)
++        unbind_variable(var.invfd);
++}
++
++const int socket_internal_parse_address
++(WORD_LIST **list, soaddr *addr, char *word, const int port) {
++    struct addrinfo *raddrs, *a, hints;
++    intmax_t n, f;
++    char *p = word != NULL ? word : (*list)->word->word;
++    memset(&hints, 0, sizeof(hints));
++    hints.ai_family = -1;
++
++    if (*list == NULL)
++        return -1;
++
++    /* If -4 or -6 was specified resolve the right ip version */
++    if (strcmp(p, "-4") == 0)
++        hints.ai_family = AF_INET;
++    else if (strcmp(p, "-6") == 0)
++        hints.ai_family = AF_INET6;
++    if (hints.ai_family > 0 && word == NULL)
++        *list = (*list)->next;
++    if (hints.ai_family > 0 || word == NULL)
++        p = (*list)->word->word;
++    if (hints.ai_family < 0)
++        hints.ai_family = AF_UNSPEC;
++
++    /* IPv4? -> IPv6? -> AF_UNIX? -> resolve */
++    addr->sa.sa_family = AF_INET;
++    if (inet_pton(AF_INET, p, &addr->in.sin_addr) != 1)
++        addr->sa.sa_family = AF_INET6;
++    if (addr->sa.sa_family == AF_INET6
++        && inet_pton(AF_INET6, p, &addr->in6.sin6_addr) != 1)
++        addr->sa.sa_family = 0;
++    if (addr->sa.sa_family == 0 && strstr(p, "/") != NULL) {
++        if ((n = snprintf(addr->un.sun_path, 107, "%s", p)) > 0 && n <= 107)
++            addr->sa.sa_family = AF_UNIX;
++    } else if (addr->sa.sa_family == 0) {
++        a = raddrs = NULL;
++        n = getaddrinfo(p, NULL, &hints, &raddrs);
++        if (n == 0 && raddrs != NULL)
++        for (a = raddrs; a; a = a->ai_next)
++            if ((f = a->ai_family) && (f == AF_INET || f == AF_INET6)
++                && (hints.ai_family == AF_UNSPEC || hints.ai_family == f))
++                break;
++        if (a) {
++            addr->sa.sa_family = a->ai_family;
++            if (a->ai_family == AF_INET)
++                memcpy(&addr->in, a->ai_addr, sizeof(addr->in));
++            else
++                memcpy(&addr->in6, a->ai_addr, sizeof(addr->in6));
++        } else {
++            builtin_error("unable to resolve %s: %s",
++                          p, gai_strerror(n));
++        }
++        if (raddrs)
++            freeaddrinfo(raddrs);
++        if (n != 0)
++            return n < 0 ? n : -n;
++    }
++    if (addr->sa.sa_family == 0) {
++        builtin_error("invalid socket address: %s", p);
++        return -1;
++    }
++    /* For inet sockets a port is also required */
++    if (port > 0 && addr->sa.sa_family != AF_UNIX) {
++        if (addr->sa.sa_family == AF_INET)
++            addr->in.sin_port = 0;
++        else
++            addr->in6.sin6_port = 0;
++        if (   (word == NULL || hints.ai_family != AF_UNSPEC)
++            && (*list = (*list)->next) == NULL) {
++            if (port > 1)
++                return 1;
++            builtin_error("port number is required");
++            return -1;
++        }
++        if (!valid_number((*list)->word->word, &n)
++            || n < 0 || n > (unsigned short)-1) {
++            if (port > 1)
++                return 1;
++            builtin_error("invalid port: %s", (*list)->word->word);
++            return -1;
++        }
++        if (addr->sa.sa_family == AF_INET)
++            addr->in.sin_port = (unsigned short)htons(n);
++        else
++            addr->in6.sin6_port = (unsigned short)htons(n);
++    }
++    *list = (*list)->next;
++    return 1;
++}
++
++const int socket_internal_timeout
++(const int fd, struct timespec *const timeout, const char *const var) {
++    struct pollfd pollfd;
++    int res = 1;
++
++    /* Skip timeout if -t not set, set SOCK_FD when socket is opened with -n */
++    if (timeout->tv_sec >= 0 && timeout->tv_nsec >= 0) {
++        pollfd = (struct pollfd){ fd, POLLIN, 0 };
++        res = ppoll(&pollfd, 1, timeout, NULL);
++    }
++    if (res < 0)
++        builtin_error("ppoll failure: %s", strerror(errno));
++    else if (res == 0) {
++        if (pollfd.revents & POLLHUP) {
++            builtin_error("ppoll failure: %s", strerror(ECONNRESET));
++            res = -1;
++        } else if (pollfd.revents & POLLNVAL) {
++            builtin_error("ppoll failure: %s", strerror(EINVAL));
++            res = -1;
++        }
++    }
++    if (res >= 0 && !socket_bind_variable_and_check(var, fd, NULL, NULL))
++        res = -1;
++    return res;
++}
+diff -Naur bash.orig/examples/loadables/socket.c bash/examples/loadables/socket.c
+--- bash.orig/examples/loadables/socket.c	1970-01-01 01:00:00.000000000 +0100
++++ bash/examples/loadables/socket.c	2026-09-05 18:34:25.354543264 +0200
+@@ -0,0 +1,564 @@
++/* accept - listen for and accept a remote network connection on a given port */
++/*
++   Copyright (C) 2020,2022,2023,2026 Free Software Foundation, Inc.
++
++   This file is part of GNU Bash.
++   Bash is free software: you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation, either version 3 of the License, or
++   (at your option) any later version.
++
++   Bash is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with Bash.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#include "socket.h"
++
++#define FAIL_EXECUTION(fd, ...) do {                        \
++    SOCKET_FAIL_EXECUTION(fd, -1, __VA_ARGS__); } while (0)
++
++static const int socket_send(intmax_t, WORD_LIST *, vars);
++static const int socket_recv(intmax_t, WORD_LIST *, vars);
++
++static int
++socket_builtin(WORD_LIST *list) {
++    soaddr addr, laddr;
++    intmax_t opt, queue = 5, sendfd = -1, recvfd = -1, sockfd = -1, n;
++    int af = -1, socktype = -1, op = -1;
++    char varbuf[VARSIZE];
++    socklen_t addrlen;
++    vars var;
++    memset((char *)&laddr, 0, sizeof(soaddr));
++    memset((char *)&addr, 0, sizeof(soaddr));
++    memset((char *)&var, 0, sizeof(var));
++
++    /* First check for -h, -s or -r on the command line */
++    if (list == NULL)
++        USAGE();
++    reset_internal_getopt ();
++    while ((opt = internal_getopt (list, "e:hm:r:s:")) != -1) {
++        if (opt == 's' || opt == 'r') {
++            if (!valid_number(list_optarg, opt == 'r' ? &recvfd : &sendfd))
++                FAIL_EXECUTION(-1, "invalid file descriptor: %s",
++                               list_optarg);
++            list = list->next;
++            return opt == 's' ? socket_send(sendfd, list, var)
++                              : socket_recv(recvfd, list, var);
++        } else if (opt == 'e' || opt == 'm') {
++            if (opt == 'e' && iperr == 0)
++                FAIL_EXECUTION(-1, "socket error queue not supported", 0);
++            n = sizeof(addr);
++            op = sizeof(socktype);
++            if (    !valid_number(list_optarg, &recvfd)
++                 || getsockname(recvfd, (SA)&addr, (socklen_t *)&n) < 0
++                 || getsockopt(recvfd, SOL_SOCKET, SO_TYPE, &socktype, &op) < 0
++                 || addr.sa.sa_family == AF_UNIX)
++                FAIL_EXECUTION(-1, "invalid file descriptor: %s", list_optarg);
++            n = 1;
++            op = sizeof(n);
++            if (    (list = list->next) != NULL
++                 && (!valid_number(list->word->word, &n) || n < 0 || n > 1))
++                FAIL_EXECUTION(-1, "%s must be 0 or 1",
++                               opt == 'e' ? "errqueue" : "mtu");
++            af = opt == 'e' ? IPERR : IPMTU;
++            if (setsockopt(recvfd, IPPROTO_IP, af, &n, op) < 0)
++                FAIL_EXECUTION(sockfd, "setsockopt %s: %s",
++                               af == IPERR ? "IPERR" : "IPMTU",
++                               strerror(errno));
++            af = opt == 'e' ? IPERR6 : IPMTU6;
++            if (    addr.sa.sa_family == AF_INET6
++                 && setsockopt(recvfd, IPPROTO_IPV6, af, &n, op) < 0)
++                FAIL_EXECUTION(sockfd, "setsockopt %s: %s",
++                               af == IPERR6 ? "IPERR6" : "IPMTU6",
++                               strerror(errno));
++            return EXECUTION_SUCCESS;
++        } else
++            USAGE();
++    }
++    if (((list = loptend) == NULL || no_options(list)) && sendfd == -1)
++        USAGE();
++
++    /* Result variable name */
++    if (    strcasecmp("SOCK_STREAM", list->word->word) != 0
++         && strcasecmp("SOCK_DGRAM", list->word->word) != 0
++         && strcasecmp("STREAM", list->word->word) != 0
++         && strcasecmp("DGRAM", list->word->word) != 0) {
++        if (strlen(list->word->word) > VARSIZE - 1 - 3)
++            FAIL_EXECUTION(-1, "variable base must be <%d characters",
++                           VARSIZE - 3);
++        var.base = list->word->word;
++        if (!valid_identifier(var.base))
++            FAIL_EXECUTION(-1, "%s: invalid variable name", var.sock);
++        list = list->next;
++    } else
++        var.base = "SOCK";
++    if (   (n = snprintf(varbuf, sizeof(varbuf), "%s_%s", var.base, "FD")) < 0
++         || n > sizeof(varbuf))
++        FAIL_EXECUTION(-1, "buffer error: %s", strerror(errno));
++    var.sock = varbuf;
++    if (list == NULL)
++        USAGE();
++    socket_unbind_variables(var);
++    /* Parse socket type keyword. */
++    if (    strcasecmp("SOCK_STREAM", list->word->word) == 0
++         || strcasecmp("STREAM", list->word->word) == 0)
++        socktype = SOCK_STREAM;
++    else if (    strcasecmp("SOCK_DGRAM", list->word->word) == 0
++              || strcasecmp("DGRAM", list->word->word) == 0)
++        socktype = SOCK_DGRAM;
++    if (socktype < 0 || (list = list->next) == NULL)
++        USAGE();
++    /* 0 = bind + listen, 1 = connect */
++    if (strcasecmp("local", list->word->word) == 0)
++        op = 0;
++    else if (strcasecmp("peer", list->word->word) == 0)
++        op = 1;
++    if (op < 0 || (list = list->next) == NULL)
++        USAGE();
++    /* Parse address */
++    addrlen = af == AF_INET  ? sizeof(addr.in) :
++                    AF_INET6 ? sizeof(addr.in6)
++                             : sizeof(addr.un);
++    if ((errno = socket_parse_address(&list, &addr, NULL, 1)) < 0)
++        FAIL_EXECUTION(-1, NULL, 0);
++    if (op == 1 && list != NULL && strcasecmp(list->word->word, "local") == 0) {
++        if ((list = list->next) == NULL)
++            USAGE();
++        if ((errno = socket_parse_address(&list, &laddr, NULL, 2)) < 0)
++            FAIL_EXECUTION(-1, NULL, 0);
++    }
++    af = addr.sa.sa_family;
++
++    if (op == 0) {
++        if (list != NULL && (sscanf(list->word->word, "%u", &queue) < 1))
++            FAIL_EXECUTION(-1, "invalid queue size: %s", list->word->word);
++        /* Fail on extraneous arguments. */
++        if (list != NULL && (list = list->next) && list != NULL)
++            USAGE();
++        if ((sockfd = socket(af, socktype, 0)) < 0)
++            FAIL_EXECUTION(-1, "%s", strerror(errno));
++        if (bind(sockfd, (SA)&addr, addrlen) < 0)
++            FAIL_EXECUTION(sockfd, "bind: %s", strerror(errno));
++        if (socktype == SOCK_STREAM && listen(sockfd, queue) < 0) {
++            if (af == AF_UNIX)
++              unlink(addr.un.sun_path);
++            FAIL_EXECUTION(sockfd, "listen: %s", strerror(errno));
++        }
++    } else {
++        /* Fail on extraneous arguments. */
++        if (list != NULL)
++            USAGE();
++        if ((sockfd = socket(af, socktype, 0)) < 0)
++            FAIL_EXECUTION(-1, "%s", strerror(errno));
++        /* Bind local socket if specified */
++        if (laddr.sa.sa_family != 0 && bind(sockfd, (SA)&laddr, addrlen) < 0)
++            FAIL_EXECUTION(sockfd, "bind: %s", strerror(errno));
++        if (connect(sockfd, (SA)&addr, addrlen) < 0) {
++            if (laddr.sa.sa_family == AF_UNIX)
++              unlink(laddr.un.sun_path);
++            FAIL_EXECUTION(sockfd, "connect: %s", strerror(errno));
++        }
++    }
++    if (pktinfo46 != 0 && socktype == SOCK_DGRAM && af != AF_UNIX) {
++        op = 1;
++        opt = af == AF_INET ? PKTINFO : PKTINFO6;
++        socktype = af == AF_INET ? IPPROTO_IP : IPPROTO_IPV6;
++        if (setsockopt(sockfd, socktype, opt, &op, sizeof(op)) < 0)
++            FAIL_EXECUTION(sockfd, "setsockopt IP%s_PKTINFO: %s",
++                           socktype == AF_INET ? "" : "V6", strerror(errno));
++    }
++    if (!socket_bind_variable(var.sock, sockfd, 0, NULL))
++        FAIL_EXECUTION(sockfd, NULL, 0);
++    return EXECUTION_SUCCESS;
++}
++
++static const int socket_send
++(intmax_t fd, WORD_LIST *list, vars var) {
++    soaddr saddr, daddr;
++    intmax_t queue, r, s, n, opt;
++    unsigned char *databuf, varbuf[VARSIZE], *p;
++    struct iovec iov[1];
++    unsigned char cmsg[cmsglen];
++    struct cmsghdr *cmsgh = (struct cmsghdr *)&cmsg;
++    struct msghdr msg = { NULL, 0, iov, 1, NULL, 0, 0 };
++    pktinfo *pkti;
++    memset((char *)&saddr, 0, sizeof(soaddr));
++    memset((char *)&daddr, 0, sizeof(soaddr));
++    memset((char *)&cmsg, 0, cmsglen);
++
++    /* Remote and local address is optional for a connected socket */
++    /* For a server socket (bind only) a remote address is required */
++   if (list && strcasecmp(list->word->word, "-b") == 0) {
++        if ((list = list->next) == NULL || list->next != NULL)
++            USAGE();
++        if (!valid_number(list->word->word, &n) || n < 65536 || n > 2147483647)
++            FAIL_EXECUTION(-1, "invalid buffer size: %s", list->word->word);
++        if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &n, sizeof(n)) < 0)
++            FAIL_EXECUTION(-1, "setsockopt SO_SNDBUF: %s", strerror(errno));
++        return EXECUTION_SUCCESS;
++   } else if (    list && strcasecmp(list->word->word, "peer") == 0
++               && (list = list->next)) {
++        if ((errno = socket_parse_address(&list, &daddr, NULL, 1)) < 0)
++            FAIL_EXECUTION(-1, NULL, 0);
++        if (    list != NULL && strcasecmp(list->word->word, "local") == 0
++             && (list = list->next)) {
++            if (pktinfo46 == 0)
++                builtin_error("local send address not supported.", 0);
++            if ((errno = socket_parse_address(&list, &saddr, NULL, 0)) < 0)
++                FAIL_EXECUTION(-1, NULL, 0);
++        }
++    }
++    /* Parse the rest of the command line for varname and queue size */
++    for (queue = 0, var.base = NULL; list; list = list->next) {
++        /* Fail on extraneous arguments. */
++        if (var.base != NULL && queue != 0)
++            USAGE();
++        if (valid_number(list->word->word, &queue)) {
++            if (queue  < 1)
++                FAIL_EXECUTION(-1, "must specify send size > 0", 0);
++        } else if (valid_identifier(list->word->word)) {
++            if (strlen(list->word->word) > VARSIZE - 1 - 6)
++                FAIL_EXECUTION(-1, "variable base must be <%d characters",
++                               VARSIZE - 6);
++            var.base = list->word->word;
++        } else
++            FAIL_EXECUTION(-1, "invalid vrariable name or size: %s",
++                           list->word->word);
++    }
++    if (var.base == NULL)
++        var.base = "SOCK";
++    if (  (n = snprintf(varbuf, sizeof(varbuf), "%s_%s", var.base, "SSIZE")) < 0
++         || n > sizeof(varbuf))
++        FAIL_EXECUTION(-1, "buffer error: %s", strerror(errno));
++    var.size = varbuf;
++    if (queue == 0)
++        queue = 8192;
++    socket_unbind_variables(var);
++
++    /* Initialze control message in case a local address was specified 
++     * We only send one msg. FRSTHDR macro leads to segfault if
++     * controllen is not set first, so we use a direct pointer to the cmsg */
++    if (daddr.sa.sa_family != 0) {
++        msg.msg_name = &daddr;
++        msg.msg_namelen = sizeof(soaddr);
++    }
++    if (pktinfo46 != 0 && (    saddr.sa.sa_family == AF_INET
++                            || saddr.sa.sa_family == AF_INET6)) {
++        msg.msg_control = &cmsg;
++        pkti = (pktinfo *)CMSG_DATA(cmsgh);
++        if (saddr.sa.sa_family == AF_INET6) {
++            msg.msg_controllen = CMSG_SPACE(sizeof(pkti->ip6));
++            cmsgh->cmsg_level = IPPROTO_IPV6;
++            cmsgh->cmsg_type = PKTINFO6S;
++            cmsgh->cmsg_len = CMSG_LEN(sizeof(pkti->ip6));
++            memcpy(&pkti->ip6.ipi6_addr, &saddr.in6.sin6_addr,
++                   sizeof(pkti->ip6));
++        } else {
++            cmsgh->cmsg_level = IPPROTO_IP;
++            cmsgh->cmsg_type = PKTINFOS;
++            if (pktinfo4 == 1) {
++                msg.msg_controllen = CMSG_SPACE(sizeof(pkti->ip));
++                cmsgh->cmsg_len = CMSG_LEN(sizeof(pkti->ip));
++                memcpy(&pkti->ip.ipi_spec_dst, &saddr.in.sin_addr,
++                       sizeof(pkti->ip));
++            } else {
++                msg.msg_controllen = CMSG_SPACE(sizeof(pkti->in));
++                cmsgh->cmsg_len = CMSG_LEN(sizeof(pkti->in));
++                memcpy(&pkti->in, &saddr.in.sin_addr, sizeof(pkti->in));
++            }
++        }
++    }
++    /* Receive from stdin and send to fd, check if sizes match, if they
++     * don't this is an error and we report the amount of data sent */
++    if ((databuf = malloc(queue)) == NULL)
++        FAIL_EXECUTION(-1, "malloc failure", strerror(errno));
++    for (s = r = n = 0, opt = 1; opt > 0 && s == r; r += n, s += opt, n = 0) {
++        while ((opt = read(0, databuf, queue - n)) > 0 && (n += opt));
++        iov[0] = (struct iovec){ databuf, n };
++        if (n > 0)
++            opt = sendmsg(fd, &msg, MSG_DONTWAIT);
++    }
++    n = errno;
++    free(databuf);
++    if (s >= 0 && !socket_bind_variable(var.size, s, NULL, NULL)) {
++        /* Receiving or sending 0 bytes is valid */
++        FAIL_EXECUTION(-1, NULL, 0);
++    }
++    if (opt < 0 || s != r) {
++        errno = n;
++        FAIL_EXECUTION(-1, "send failure: (%d/%d) %s", s, r, strerror(errno));
++    }
++    return EXECUTION_SUCCESS;
++}
++
++static const int socket_recv
++(const intmax_t fd, WORD_LIST *list, vars var) {
++    soaddr addr1, addr2, *saddr = &addr1, *daddr = &addr2;
++    intmax_t queue, s, r, n, opt, err;
++    unsigned char *databuf, varbuf[11][VARSIZE], *p;
++    struct timespec timeout = { -1, -1 };
++    struct iovec iov[1];
++    unsigned char cmsg[cmsglen];
++    struct cmsghdr *cmsgh;
++    struct msghdr msg;
++    struct sock_extended_err *serr;
++    pktinfo *pkti;
++    memset((char *)saddr, 0, sizeof(soaddr));
++    memset((char *)daddr, 0, sizeof(soaddr));
++    memset((char *)cmsg, 0, sizeof(struct cmsghdr));
++
++    /* Parse command line unitl all parameters are set, or no more words. */
++   if (list && strcasecmp(list->word->word, "-b") == 0) {
++        if ((list = list->next) == NULL || list->next != NULL)
++            USAGE();
++        if (!valid_number(list->word->word, &n) || n < 65536 || n > 2147483647)
++            FAIL_EXECUTION(-1, "invalid buffer size: %s", list->word->word);
++        if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &n, sizeof(n)) < 0)
++            FAIL_EXECUTION(-1, "setsockopt SO_RCVBUF: %s", strerror(errno));
++        return EXECUTION_SUCCESS;
++   } else for (err = opt = queue = 0; list; list = list->next) {
++        /* Fail on extraneous arguments. */
++        if (err != 0 && queue != 0 && timeout.tv_sec != -1 && var.base != NULL)
++            USAGE();
++        /* Nrs are not valid variable names */
++        if (strcasecmp(list->word->word, "-e") == 0) {
++            err = MSG_ERRQUEUE;
++        } else if (strcasecmp(list->word->word, "-m") == 0) {
++            n = sizeof(s);
++            if (getsockopt(fd, IPPROTO_IP, IP_MTU, &s, (void *)&n) < 0)
++                FAIL_EXECUTION(-1, "getsockopt: %s", strerror(errno));
++            fprintf(stdout, "%d\n", s);
++            return EXECUTION_SUCCESS;
++        } else if (!valid_identifier(list->word->word)) {
++            if (    (queue == 0 && !valid_number(list->word->word, &opt))
++                 || (queue != 0 && ( uconvert(list->word->word, &timeout.tv_sec,
++                                              &timeout.tv_nsec, (char **)0) == 0
++                                    || timeout.tv_sec < 0
++                                    || timeout.tv_nsec < 0)))
++                FAIL_EXECUTION(-1, "%s: invalid name, queue or timeout",
++                               list->word->word);
++            if (queue == 0 && opt > 0)
++                queue = opt;
++        } else if (var.base == NULL) {
++            if (strlen(list->word->word) > VARSIZE - 1 - 6)
++                FAIL_EXECUTION(-1, "variable base must be <%d characters",
++                               VARSIZE - 6);
++            var.base = list->word->word;
++        }
++    }
++    if (queue <= 0)
++        FAIL_EXECUTION(-1, "receive size must be > 0", 0);
++    if (timeout.tv_nsec > 0)
++        timeout.tv_nsec *= 1000;
++    if (var.base == NULL)
++        var.base = "SOCK";
++    for (n = 0; n < 11; n++) {
++        p =  n == 0 ? "SADDR" : n == 1 ? "SPORT" : n == 2 ? "DADDR" :
++             n == 3 ? "DPORT" : n == 4 ? "RSIZE" : n == 5 ? "EERRNO" :
++             n == 6 ? "EORIG" : n == 7 ? "ETYPE" : n == 8 ? "ECODE" :
++             n == 9 ? "EOFFEN" : "ESIZE";
++        s = sizeof(varbuf[n]);
++        if ((r = snprintf(varbuf[n], s, "%s_%s", var.base, p)) < 0 || r > s)
++            FAIL_EXECUTION(-1, "buffer error: %s", strerror(errno));
++    }
++    var.host = varbuf[0], var.port = varbuf[1];
++    var.lhost = varbuf[2], var.lport = varbuf[3], var.size = varbuf[4];
++    var.eerrno = varbuf[5], var.eorig = varbuf[6];
++    var.etype = varbuf[7], var.ecode = varbuf[8];
++    var.eoffen = varbuf[9], var.esize = varbuf[10];
++    socket_unbind_variables(var);
++
++    /* Check for data with timeout */
++    if ((opt = socket_timeout(fd, &timeout, NULL)) < 0)
++        FAIL_EXECUTION(-1, NULL, 0);
++    if (opt == 0)
++        return EXECUTION_SUCCESS;
++
++    /* Receive data from socket and send to stdout check if sizes match
++     * don't this is an error and we report the amount of data sent */
++    if ((databuf = malloc(queue)) == NULL)
++        FAIL_EXECUTION(-1, "malloc failure", strerror(errno));
++    iov[0] = (struct iovec){ databuf, queue };
++    msg = (struct msghdr){ saddr, sizeof(soaddr), iov, 1, &cmsg, cmsglen, 0 };
++    s = r = -1;
++    errno = opt = 0;
++    if ((r = recvmsg(fd, &msg, err)) >= 0)
++        s = write(1, databuf, r);
++    opt = errno;
++    free(databuf);
++    if (opt == 0 && msg.msg_flags & MSG_TRUNC)
++        opt = ENOBUFS;
++
++    for (cmsgh = CMSG_FIRSTHDR(&msg); cmsgh; cmsgh = CMSG_NXTHDR(&msg, cmsgh)) {
++        /* Get the destination IP in the control message if supported by OS */
++        if (pktinfo46 != 0) {
++            pkti = (pktinfo *)CMSG_DATA(cmsgh);
++            if (    cmsgh->cmsg_level == IPPROTO_IPV6
++                 && cmsgh->cmsg_type == PKTINFO6S) {
++                daddr->sa.sa_family = AF_INET6;
++                memcpy(&daddr->in6.sin6_addr, &pkti->ip6.ipi6_addr,
++                       sizeof(struct in6_addr));
++            } else if (    pktinfo4 == 1 && cmsgh->cmsg_level == IPPROTO_IP
++                        && cmsgh->cmsg_type == PKTINFO) {
++                daddr->sa.sa_family = AF_INET;
++                memcpy(&daddr->in.sin_addr, &pkti->ip.ipi_addr,
++                       sizeof(struct in_addr));
++            } else if (    pktinfo4 == 2 && cmsgh->cmsg_level == IPPROTO_IP
++                        && cmsgh->cmsg_type == PKTINFO) {
++                daddr->sa.sa_family = AF_INET;
++                memcpy(&daddr->in.sin_addr, &pkti->in, sizeof(struct in_addr));
++            }
++        }
++        /* When receiving error queue, set error variables */
++        if (    iperr != 0 && err == MSG_ERRQUEUE
++             && (cmsgh->cmsg_type == IPERR || cmsgh->cmsg_type == IPERR6)) {
++            serr = (struct sock_extended_err *)CMSG_DATA(cmsgh);
++            if (   !socket_bind_variable(var.eerrno, serr->ee_errno, NULL, NULL)
++                 || !socket_bind_variable(var.eorig, serr->ee_origin, NULL,
++                                          NULL)
++                 || !socket_bind_variable(var.etype, serr->ee_type, NULL, NULL)
++                 || !socket_bind_variable(var.ecode, serr->ee_code, NULL, NULL)
++                 || !socket_bind_variable(var.eoffen, -1,
++                                          (void *)SO_EE_OFFENDER(serr), NULL)
++                 || (    serr->ee_info != 0
++                      && !socket_bind_variable(var.esize, serr->ee_info, NULL,
++                                             NULL)))
++                FAIL_EXECUTION(-1, NULL, 0);
++        }
++    }
++
++    /* Set variables, rhost, rport and lhost when data was received
++     * and size when data was sent to stdout. When receiving error queue
++     * the source and destination address are swapped, so that the original
++     * source and destination address match the packet that was sent. */
++    if (err == MSG_ERRQUEUE)
++        saddr = &addr2, daddr = &addr1;
++    if (s >= 0 && !socket_bind_variable(var.size, s, NULL, NULL))
++        /* Receiving or sending 0 bytes is valid */
++        FAIL_EXECUTION(-1, NULL, 0);
++    if (r >= 0 && saddr->sa.sa_family != 0) {  /* 0 = STREAM socket */
++        if (!socket_bind_variable(var.host, -1, saddr, NULL))
++            FAIL_EXECUTION(-1, NULL, 0);
++        n = saddr->sa.sa_family == AF_INET  ? saddr->in.sin_port :
++                                   AF_INET6 ? saddr->in6.sin6_port : 0;
++        if (n != 0 && !socket_bind_variable(var.port, ntohs(n), NULL, NULL))
++            FAIL_EXECUTION(-1, NULL, 0);
++        if (    daddr->sa.sa_family != 0
++             && !socket_bind_variable(var.lhost, -1, daddr, NULL))
++            FAIL_EXECUTION(-1, NULL, 0);
++        n = daddr->sa.sa_family == AF_INET  ? daddr->in.sin_port :
++                                   AF_INET6 ? daddr->in6.sin6_port : 0;
++        if (n != 0 && !socket_bind_variable(var.lport, ntohs(n), NULL, NULL))
++            FAIL_EXECUTION(-1, NULL, 0);
++    }
++    if (r < 0 || s < 0 || s != r || opt != 0) {
++        errno = opt;
++        FAIL_EXECUTION(-1, "receive failure: %s", strerror(opt));
++    }
++    return EXECUTION_SUCCESS;
++}
++
++static char *const socket_doc[] = {
++    "Provides an interface for creating and using POSIX sockets",
++    "The result socket handle is written to the variable denoted by varname.",
++    "The default varname is SOCK_FD. Parameters are case insensitive.",
++    "AF_UNIX, AF_INET, AF_INET6 (case insensitive) cannot be used as varname.",
++    "The default queue (backlog) size is 5.",
++    "",
++    "socket -s and socket -r.",
++    "Sends to or receives data from a socket. This mostly applies to SOCK_DGRAM",
++    "sockets. read cannot be called on such sockets, as read() calls block.",
++    "Data is read standard input and written to standard output.",
++    "",
++    "Receiving data requires a queue size to be set. By default no timeout is",
++    "used. Three variables will be set, SOCK_RHOST, SOCK_RPORT and SOCK_RSIZE.",
++    "If the socket is AF_UNIX SOCK_RHOST will be set to the remote socket path",
++    "and SOCK_RPORT will not be set. SOCK_RSIZE is set to the size of the",
++    "received datagram. Only a queue size is mandatory, the order is flexible,",
++    "the first number will be the queue size, the second number the timeout,",
++    "variable names are in order: RHOST, RPORT, RSIZE.",
++    "On success 0 is returned and the variables will be set. On failure 1 is",
++    "returned (or the OS value of EADDRINUSE).",
++    "On timeout success is returned and no variables will be set",
++    "",
++    "Sending data requires a remote address and port, or remote socket path",
++    "in case of an AF_UNIX socket. When sending data to an AF_UNIX socket, if",
++    "a local path is not specified, the peer socket will not have a remote",
++    "path and will not be able to reply. Message or FD passing is not",
++    "implemented, neither are abstract sockets. A maximum [size] of data",
++    "to be sent can optionally be specified. The size of the data sent to the",
++    "socket is saved in variable svarsize (SOCK_SSIZE). When sending data to",
++    "SOCK_STREAM sockets the remote address is ignored by the OS.",
++    "",
++    "NOTES: - On the client side of SOCK_DGRAM you can use normal IO redirection",
++    "         like 'echo Hello >&fd', as the socket is fully connected.",
++    "       - On the server side of SOCK_DGRAM sockets 'socket -s' with remote",
++    "         adress is necesary. The OS needs an address to send to. >&fd will",
++    "         yield an endpoint not connected error.",
++    "       - Doing something like 'echo Hello | socket -s fd ...' is not useful.",
++    "         Due to bash semantics this will be run in a subshell and the",
++    "         SOCK_RSIZE variable will not be set in the calling shell. You have",
++    "         to use here documents or IO redirection:",
++    "           'socket -s fd ... <<<\"Hello\"'",
++    "           'socket -s fd ... <&fd'",
++    "           'socket -s fd ... < <(echo Hello)",
++    "       - Receving on SOCK_STREAM sockets will not set RHOST and RPORT.",
++    "       - Sending on SOCK_STREAM sockets will ignore the remote address",
++    "       - SOCK_STREAM sockets can be used with normal bash read and write.",
++    "         reliable delivery is assured by the OS, so checking send or",
++    "         receive sizes is not necessary.",
++    "         and port. The data is always sent to the connected endpoint.",
++    "       - On SOCK_DGRAM sockets you can never send more then the maximum",
++    "         datagram size, which is interface mtu - ip headers - udp header",
++    "         for udp datagrams. For UNIX sockets the size depends on OS and",
++    "         what is configured.",
++    "       - When receiving data on SOCK_DGRAM sockets the entire datagram",
++    "         must be read, the buffer must match the maximum datgram size",
++    "         accordingly. Any data not read from a datagram will be discarded.",
++    "",
++    "Examples:",
++    "         socket SOCKFD AF_UNIX SOCK_STREAM local /tmp/sock",
++    "           Opens a local UNIX STREAM socket in /tmp/sock.",
++    "           SOCKFD will be set to the fd",
++    "         socket SOCKFD af_inet6 sock_dgram local :: 12345",
++    "           Opens a ipv6 udp socket on all ip addresses port 12345.",
++    "           SOCKFD will be set to the fd",
++    "         socket AF_INET sock_stream local 1.2.3.4 80 100",
++    "           Opens ipv4 tcp socket on ip 1.2.3.4 port 80 queue size 100.",
++    "           SOCK_FD will be set to the fd.",
++    "         socket AF_INET6 SOCK_STREAM PEER 2a00:400::1 443",
++    "           Connects to ipv6 adress 2a00:400::1 on tcp port 443.",
++    "           SOCK_FD will be set to te fd.",
++    "         socket fd af_unix sock_dgram PEER /tmp/sock",
++    "           Connects to UNIX datagram socket /tmp/sock.",
++    "           fd will be set to the fd",
++    "         socket -s 3 1.2.3.4 1234",
++    "           Sends data from stdin on the socket fd 3 to 1.2.3.4:1234.",
++    "         socket -r 3 1000 10 RHOST RPORT RSIZE",
++    "           Receives max 1000 bytes of data on socket fd 3, RHOST",
++    "           contains the remote ip / path, RPORT the remote port and",
++    "           RSIZE the recieved size. Timeout of 10 seconds.",
++    "         socket -r 3 RHOST 1000 RPORT 10 RSIZE",
++    "           Same as above.a,"
++    "         socket -r 3 RHOST 1000 10.1",
++    "           In this case the default of SOCK_RPORT and SOCK_RSIZE",
++    "           will be used and a timeout of 10.1 seconds.",
++    NULL
++};
++
++struct builtin socket_struct = {
++    .name = "socket",
++    .function = socket_builtin,
++    .flags = BUILTIN_ENABLED,
++    .long_doc = socket_doc,
++    .short_doc =
++    "socket [varname] SOCK_STREAM|SOCK_DGRAM local|peer ADDRESS [port] [queue]\n"
++    "               socket -s fd [[peer addr [port]] [[local [addr]] [varbase] [size]\n"
++    "               socket -r fd size [timeout] [varbase]",
++    .handle = NULL
++};
+diff -Naur bash.orig/examples/loadables/socket.h bash/examples/loadables/socket.h
+--- bash.orig/examples/loadables/socket.h	1970-01-01 01:00:00.000000000 +0100
++++ bash/examples/loadables/socket.h	2026-09-05 18:34:25.354632789 +0200
+@@ -0,0 +1,167 @@
++/* accept - listen for and accept a remote network connection on a given port */
++/*
++   Copyright (C) 2020,2022,2023,2026 Free Software Foundation, Inc.
++
++   This file is part of GNU Bash.
++   Bash is free software: you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation, either version 3 of the License, or
++   (at your option) any later version.
++
++   Bash is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with Bash.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++#ifndef __SOCKET_BUILTIN_H
++#define __SOCKET_BUILTIN_H 1
++
++#include <config.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include "bashtypes.h"
++#include <errno.h>
++#include <time.h>
++#include <limits.h>
++#include "typemax.h"
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <netdb.h>
++#include <poll.h>
++#include "loadables.h"
++
++
++#define USAGE(x) do { \
++    builtin_usage();  \
++    return EX_USAGE;  \
++    } while (0)
++
++#define SOCKET_FAIL_EXECUTION SOCKET_INTERNAL_FAIL_EXECUTION
++#define ACCEPT_FAIL_EXECUTION SOCKET_INTERNAL_FAIL_EXECUTION
++#define POLL_FAIL_EXECUTION SOCKET_INTERNAL_FAIL_EXECUTION
++#define SOCKET_INTERNAL_FAIL_EXECUTION(fd1, fd2, msg, ...) do { \
++    int err = errno;                                                         \
++    if (msg) builtin_error(msg, __VA_ARGS__);                                \
++    if (fd1 >= 0) close (fd1);                                               \
++    if (fd2 >= 0) close (fd2);                                               \
++    return err != 0 ? err : EXECUTION_FAILURE; \
++    } while (0)
++
++#ifdef IPV6_RECVPKTINFO
++  #define PKTINFO6 IPV6_RECVPKTINFO
++  #define PKTINFO6S IPV6_PKTINFO
++  static const int pktinfo6 = 1;
++#elif IPV6_PKTINFO
++  #define PKTINFO6 IPV6_PKTINFO
++  #define PKTINFO6S IPV6_PKTINFO
++  static const int pktinfo6 = 1;
++#endif
++#ifdef IP_PKTINFO
++  #define PKTINFO IP_PKTINFO
++  #define PKTINFOS IP_PKTINFO
++  static const int pktinfo4 = 1;
++#elif IP_RCVDSTADDR
++  #ifdef IP_SENDSSRCADDR
++    #define PKTINFO IP_RECVDSTADDR
++    #define PKTINFOS IP_SENDSRCADDR
++    static const int pktinfo4 = 2;
++  #endif
++#endif
++#ifndef IP_PKTINFO
++  struct in_pktinfo { int ipi_spec_dst, ipi_addr; };
++#endif
++#ifndef IPV6_PKTINFO
++  struct in6_pktinfo { int ipi6_addr; };
++#endif
++#ifndef PKTINFO
++  #define PKTINFO -1
++  #define PKTINFOS -1
++  static const int pktinfo4 = 0;
++#endif
++#ifndef PKTINFO6
++  #define PKTINFO6 -1
++  #define PKTINFO6S -1
++  static const int pktinfo6 = 0;
++#endif
++#ifdef IP_RECVERR
++  #ifdef IPV6_RECVERR
++    #include <linux/errqueue.h>
++    #define IPERR IP_RECVERR
++    #define IPERR6 IPV6_RECVERR
++    static const int iperr = 1;
++  #endif
++#endif
++#ifndef IPERR
++  #undef MSQ_ERRQUEUE
++  #define MSG_ERRQUEUE -1
++  #define SO_EE_OFFENDER(x)  NULL
++  #define IPERR -1
++  #define IPERR6 -1
++  struct sock_extended_err { int ee_errno, ee_origin, ee_type,
++                                 ee_code, ee_info; };
++  static const int iperr = 0;
++#endif
++#ifdef IP_MTU_DISCOVER
++  #define IPMTU IP_MTU_DISCOVER
++#elif IP_DONTFRAG
++  #define IPMTU IP_DONTFRAG
++#else
++  #define IPMTU -1
++#endif
++#ifdef IPV6_MTU_DISCOVER
++  #define IPMTU6 IPV6_MTU_DISCOVER
++#elif IPV6_DONTFRAG
++  #define IPMTU6 IPV6_DONTFRAG
++#else
++  #define IPMTU6 -1
++#endif
++
++#define VARSIZE 32
++#define SA struct sockaddr *
++static const int pktinfo46 = (pktinfo4 && pktinfo6);
++
++typedef union { struct sockaddr     sa;
++                struct sockaddr_in  in;
++                struct sockaddr_in6 in6;
++                struct sockaddr_un  un; } soaddr;
++typedef struct { char *base, *fd, *sock, *host, *port, *lhost, *lport, *size;
++                 char *eerrno, *eorig, *etype, *ecode, *eoffen, *esize;
++                 char *readfd, *writefd, *prifd, *errfd, *hupfd, *invfd; } vars;
++
++typedef union { struct in_pktinfo        ip;
++                struct in6_pktinfo       ip6;
++                struct in_addr           in; } pktinfo;
++
++static const size_t cmsglen = CMSG_SPACE(sizeof(pktinfo))
++                            + CMSG_SPACE(sizeof(struct sock_extended_err)
++                                         + sizeof(soaddr));
++
++#define socket_bind_variable socket_bind_variable_and_check
++#define accept_bind_variable socket_bind_variable_and_check
++#define poll_bind_variable socket_bind_variable_and_check
++extern const int socket_bind_variable_and_check
++(const char *const, const int, const soaddr *, char *);
++
++#define socket_unbind_variables socket_unbind_variables_and_check
++#define accept_unbind_variables socket_unbind_variables_and_check
++#define poll_unbind_variables socket_unbind_variables_and_check
++extern void socket_unbind_variables_and_check(const vars);
++
++#define socket_parse_address socket_internal_parse_address
++#define accept_parse_address socket_internal_parse_address
++extern const int socket_internal_parse_address
++(WORD_LIST **, soaddr *, char *, const int);
++
++#define socket_timeout socket_internal_timeout
++#define accept_timeout socket_internal_timeout
++extern const int socket_internal_timeout
++(const int, struct timespec *const, const char *const);
++
++#endif  /* __SOCKET_BUILTIN_H */
